@@ -18,6 +18,8 @@ from telegram import Bot, Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 from telegram.parsemode import ParseMode
 
+from app.readiness_gate import build_pr_readiness_block
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,6 +68,16 @@ class TelegramNotifier:
             f"*Reasoning:* {reasoning}\n\n"
             f"*Risks:*\n{risks_text}"
             f"{trigger_note}"
+        )
+        msg += build_pr_readiness_block(
+            pr_title=pr_title,
+            decision=decision,
+            summary=summary,
+            reasoning=reasoning,
+            risks=risks,
+            human_reason=human_reason,
+            hold_trigger=hold_trigger,
+            pr_number=pr_number,
         )
 
         if human_reason:
@@ -269,7 +281,8 @@ class TelegramCommandHandler:
             "proceed", "sure", "sure la", "do it", "lets do it", "let's do it",
             "confirm", "confirmed", "jalan", "boleh", "can", "can lah", "let's go",
         ]
-        if any(phrase == text_lower or text_lower.startswith(phrase + " ") for phrase in KICKOFF_PHRASES):
+        is_short_kickoff = len(parts) <= 4 and text_lower in KICKOFF_PHRASES
+        if is_short_kickoff:
             update.message.reply_text("On it. Creating the next task...")
             self.action_callback("kickoff", None, update)
             return
