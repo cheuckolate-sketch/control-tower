@@ -18,6 +18,7 @@ import base64
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -25,7 +26,7 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 PRODUCT_REPO = "cheuckolate-sketch/creator-campaign-os-backend"
 PHASES_PATH = "docs/phases.json"
@@ -93,10 +94,81 @@ You are not a chatbot. You are a project manager.
 
 
 class ProjectManager:
-    def __init__(self, github_client=None):
-        self.openai = OpenAI(api_key=OPENAI_API_KEY)
+    def __init__(
+        self,
+        github_client=None,
+        ai_briefings_enabled: bool = True,
+        intent_parser_enabled: bool = False,
+        cache_ttl_seconds: int = 900,
+        call_recorder=None,
+    ):
+        self.openai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
         self.github = github_client
         self._phase_map_cache = None
+        self.ai_briefings_enabled = ai_briefings_enabled
+        self.intent_parser_enabled = intent_parser_enabled
+        self.cache_ttl_seconds = cache_ttl_seconds
+        self.call_recorder = call_recorder
+        self._briefing_cache: dict[str, tuple[float, str]] = {}
+
+    def _record_openai_call(self, category: str):
+        if self.call_recorder:
+            self.call_recorder(category)
+
+    def _cached(self, key: str) -> str | None:
+        cached = self._briefing_cache.get(key)
+        if not cached:
+            return None
+        saved_at, value = cached
+        if time.time() - saved_at <= self.cache_ttl_seconds:
+            return value
+        self._briefing_cache.pop(key, None)
+        return None
+
+    def _store_cache(self, key: str, value: str) -> str:
+        self._briefing_cache[key] = (time.time(), value)
+        return value
+
+    def _create_chat_completion(self, category: str, **kwargs):
+        if not self.openai:
+            raise RuntimeError("OPENAI_API_KEY is not configured.")
+        response = self.openai.chat.completions.create(**kwargs)
+        self._record_openai_call(category)
+        return response
+
+    def get_phase_map_snapshot(self) -> dict | None:
+        if self._phase_map_cache:
+            return self._phase_map_cache
+        existing = self._load_phases()
+        if existing:
+            self._phase_map_cache = existing
+        return existing
+
+    def get_active_phase_snapshot(self) -> dict | None:
+        phase_map = self.get_phase_map_snapshot()
+        if not phase_map:
+            return None
+        return self.get_active_phase(phase_map)
+
+    def _deterministic_checkpoint_summary(self, command_name: str) -> str:
+        phase_map = self.get_phase_map_snapshot()
+        active = self.get_active_phase(phase_map) if phase_map else None
+        active_text = "Not verified"
+        if active:
+            active_text = f"Phase {active.get('id')}: {active.get('name')} [{active.get('status')}]"
+        merged = self._get_merged_prs(limit=3)
+        issues = self._get_open_issues()
+        merged_text = "\n".join([f"- PR #{pr['number']}: {pr['title']}" for pr in merged[:3]]) or "- Not verified"
+        issue_text = "\n".join([f"- Issue #{issue['number']}: {issue['title']}" for issue in issues[:3]]) or "- None"
+        return (
+            f"*{command_name} checkpoint summary*\n\n"
+            f"*Active phase:* {active_text}\n"
+            f"*Latest merged PRs:*\n{merged_text}\n\n"
+            f"*Open issues:*\n{issue_text}\n\n"
+            "Deployment status: Not verified.\n"
+            "Live runtime state: Not verified.\n"
+            "Use `checkpoint <runtime fact>` after checking the live endpoint or Railway deploy state."
+        )
 
     # ─────────────────────────────────────────────
     # CORE DATA FETCHING
@@ -320,7 +392,8 @@ Respond with JSON only:
   ]
 }}"""
 
-        response = self.openai.chat.completions.create(
+        response = self._create_chat_completion(
+            "background_ai",
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": PM_SYSTEM_PROMPT + "\n\n" + PROJECT_CONTEXT},
@@ -403,7 +476,8 @@ Respond with JSON only:
   "summary": "one sentence for Cheuck"
 }}"""
 
-        response = self.openai.chat.completions.create(
+        response = self._create_chat_completion(
+            "background_ai",
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
@@ -432,6 +506,9 @@ Respond with JSON only:
 
     def get_full_briefing(self) -> str:
         """What's next — full context briefing for Cheuck."""
+        if not self.ai_briefings_enabled:
+            return self._deterministic_checkpoint_summary("What's next")
+
         merged_prs = self._get_merged_prs(limit=30)
         phase_map = self.get_or_init_phases()
         open_issues = self._get_open_issues()
@@ -447,6 +524,10 @@ Respond with JSON only:
             velocity_note = f"⚠️ No merges in {velocity['days_since_last_merge']} days. Build may be stalled."
 
         open_issues_note = f"Open issues in backlog: {len(open_issues)}" if open_issues else ""
+        cache_key = f"full_briefing:{phase_map.get('last_updated', '')}:{len(merged_prs)}:{len(open_issues)}:{velocity.get('last_merge_at')}"
+        cached = self._cached(cache_key)
+        if cached:
+            return cached
 
         prompt = f"""Give Cheuck a plain English project briefing. Max 5 sentences.
 
@@ -468,7 +549,8 @@ Tell him:
 
 Plain English. No PR numbers. No file names. No jargon. Conversational."""
 
-        response = self.openai.chat.completions.create(
+        response = self._create_chat_completion(
+            "pm_briefing",
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": PM_SYSTEM_PROMPT + "\n\n" + PROJECT_CONTEXT},
@@ -477,7 +559,7 @@ Plain English. No PR numbers. No file names. No jargon. Conversational."""
             temperature=0.3,
             max_tokens=350,
         )
-        return response.choices[0].message.content.strip()
+        return self._store_cache(cache_key, response.choices[0].message.content.strip())
 
     def get_phase_summary(self) -> str:
         """All phases + status formatted for Telegram."""
@@ -493,6 +575,9 @@ Plain English. No PR numbers. No file names. No jargon. Conversational."""
 
     def get_active_phase_detail(self) -> str:
         """Where are we — current phase detail with gap analysis."""
+        if not self.ai_briefings_enabled:
+            return self._deterministic_checkpoint_summary("Where are we")
+
         phase_map = self.get_or_init_phases()
         active = self.get_active_phase(phase_map)
         if not active:
@@ -500,6 +585,10 @@ Plain English. No PR numbers. No file names. No jargon. Conversational."""
 
         merged_prs = self._get_merged_prs(limit=30)
         pr_context = self._format_pr_context(merged_prs)
+        cache_key = f"active_phase:{active.get('id')}:{active.get('status')}:{len(merged_prs)}"
+        cached = self._cached(cache_key)
+        if cached:
+            return cached
 
         prompt = f"""Give Cheuck a one-paragraph update on where Phase {active['id']} stands.
 
@@ -513,7 +602,8 @@ Recent merged PRs:
 Based on the PRs, what has been built so far in this phase and what's still missing?
 Plain English. 3-4 sentences. No jargon."""
 
-        response = self.openai.chat.completions.create(
+        response = self._create_chat_completion(
+            "pm_briefing",
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": PM_SYSTEM_PROMPT},
@@ -522,10 +612,16 @@ Plain English. 3-4 sentences. No jargon."""
             temperature=0.3,
             max_tokens=250,
         )
-        return f"*Phase {active['id']}: {active['name']}*\n\n" + response.choices[0].message.content.strip()
+        return self._store_cache(
+            cache_key,
+            f"*Phase {active['id']}: {active['name']}*\n\n" + response.choices[0].message.content.strip(),
+        )
 
     def get_whats_left(self) -> str:
         """Gap analysis — what's specifically still missing in the active phase."""
+        if not self.ai_briefings_enabled:
+            return self._deterministic_checkpoint_summary("What's left")
+
         phase_map = self.get_or_init_phases()
         active = self.get_active_phase(phase_map)
         if not active:
@@ -533,6 +629,10 @@ Plain English. 3-4 sentences. No jargon."""
 
         merged_prs = self._get_merged_prs(limit=30)
         pr_context = self._format_pr_context(merged_prs)
+        cache_key = f"whats_left:{active.get('id')}:{active.get('status')}:{len(merged_prs)}"
+        cached = self._cached(cache_key)
+        if cached:
+            return cached
 
         prompt = f"""Based on merged PRs, identify exactly what's still missing for Phase {active['id']} to be complete.
 
@@ -545,7 +645,8 @@ Merged PRs:
 List only what's genuinely missing — not done yet. Be specific.
 Format as a short bullet list. Plain English. No file names."""
 
-        response = self.openai.chat.completions.create(
+        response = self._create_chat_completion(
+            "pm_briefing",
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": PM_SYSTEM_PROMPT},
@@ -554,10 +655,16 @@ Format as a short bullet list. Plain English. No file names."""
             temperature=0.2,
             max_tokens=300,
         )
-        return f"*What's still needed for Phase {active['id']}:*\n\n" + response.choices[0].message.content.strip()
+        return self._store_cache(
+            cache_key,
+            f"*What's still needed for Phase {active['id']}:*\n\n" + response.choices[0].message.content.strip(),
+        )
 
     def get_weekly_summary(self) -> str:
         """Monday morning summary with velocity and cost context."""
+        if not self.ai_briefings_enabled:
+            return self._deterministic_checkpoint_summary("Weekly summary")
+
         merged_prs = self._get_merged_prs(limit=30)
         phase_map = self.get_or_init_phases()
         open_issues = self._get_open_issues()
@@ -586,7 +693,8 @@ Tell him:
 
 Brief. Conversational. Max 6 sentences."""
 
-        response = self.openai.chat.completions.create(
+        response = self._create_chat_completion(
+            "weekly_summary",
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": PM_SYSTEM_PROMPT + "\n\n" + PROJECT_CONTEXT},
@@ -649,7 +757,8 @@ The body must include:
 Detailed enough that the AI builder can implement without asking any questions."""
 
         try:
-            response = self.openai.chat.completions.create(
+            response = self._create_chat_completion(
+                "pm_briefing",
                 model="gpt-4o",
                 messages=[
                     {"role": "system", "content": PM_SYSTEM_PROMPT + "\n\n" + PROJECT_CONTEXT},
@@ -670,6 +779,9 @@ Detailed enough that the AI builder can implement without asking any questions."
         Returns one of: whats_next, kickoff, phases, where_are_we, whats_left,
                         approve_phase, weekly_summary, status, unknown
         """
+        if not self.intent_parser_enabled:
+            return "unknown"
+
         prompt = f"""A user sent this message to a project management bot: "{text}"
 
 Last thing the bot said: "{last_context}"
@@ -688,7 +800,8 @@ Map this message to one of these actions:
 Return JSON only: {{"action": "action_name", "confidence": "high|medium|low"}}"""
 
         try:
-            response = self.openai.chat.completions.create(
+            response = self._create_chat_completion(
+                "intent_parser",
                 model="gpt-4o",
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},

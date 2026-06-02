@@ -114,6 +114,58 @@ class GitHubClient:
             logger.error(f"Failed to fetch issues: {e}")
             return []
 
+    def get_open_pr_summaries(self, limit: int = 5) -> list[dict]:
+        try:
+            summaries = []
+            for pr in self.get_open_prs()[:limit]:
+                summaries.append({
+                    "number": pr.number,
+                    "title": pr.title,
+                    "state": pr.state,
+                    "draft": pr.draft,
+                    "mergeable": pr.mergeable,
+                    "url": pr.html_url,
+                })
+            return summaries
+        except Exception as e:
+            logger.error(f"Failed to build open PR summaries: {e}")
+            return []
+
+    def get_open_issue_summaries(self, limit: int = 5) -> list[dict]:
+        try:
+            summaries = []
+            for issue in self.get_issues(state="open"):
+                if getattr(issue, "pull_request", None):
+                    continue
+                summaries.append({
+                    "number": issue.number,
+                    "title": issue.title,
+                    "state": issue.state,
+                    "url": issue.html_url,
+                })
+                if len(summaries) >= limit:
+                    break
+            return summaries
+        except Exception as e:
+            logger.error(f"Failed to build open issue summaries: {e}")
+            return []
+
+    def get_latest_closed_unmerged_pr(self) -> dict | None:
+        try:
+            for pr in self.repo.get_pulls(state="closed", sort="updated", direction="desc"):
+                if not pr.merged_at:
+                    return {
+                        "number": pr.number,
+                        "title": pr.title,
+                        "state": pr.state,
+                        "url": pr.html_url,
+                        "closed_at": pr.closed_at.isoformat() if pr.closed_at else None,
+                    }
+            return None
+        except GithubException as e:
+            logger.error(f"Failed to fetch closed unmerged PR: {e}")
+            return None
+
     def create_issue(self, title: str, body: str) -> object | None:
         """
         Create a GitHub Issue and immediately add the ai-build label.

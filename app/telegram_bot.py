@@ -19,6 +19,7 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, Callb
 from telegram.parsemode import ParseMode
 
 from app.readiness_gate import build_pr_readiness_block
+from app.operator import build_operator_action_card
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,8 @@ class TelegramNotifier:
             logger.error(f"Telegram send failed: {e}")
 
     def send_pr_alert(self, pr_number, pr_title, pr_url,
-                      decision, summary, reasoning, risks, human_reason, hold_trigger="none"):
+                      decision, summary, reasoning, risks, human_reason, hold_trigger="none",
+                      files_changed=None, check_runs=None):
         decision_emoji = {"MERGE": "✅", "FIX": "🔧", "HOLD": "⛔", "AUTO_MERGE": "✅"}.get(decision, "❓")
         risks_text = "\n".join([f"• {r}" for r in risks]) if risks else "None"
 
@@ -78,6 +80,15 @@ class TelegramNotifier:
             human_reason=human_reason,
             hold_trigger=hold_trigger,
             pr_number=pr_number,
+        )
+        msg += build_operator_action_card(
+            pr_number=pr_number,
+            pr_title=pr_title,
+            decision=decision,
+            files=files_changed,
+            checks=check_runs,
+            risks=risks,
+            hold_trigger=hold_trigger,
         )
 
         if human_reason:
@@ -164,7 +175,8 @@ class TelegramNotifier:
         self.send_message(
             "⬡ *Control Tower V3 Online*\n\n"
             "Watching `cheuckolate-sketch/creator-campaign-os-backend`\n\n"
-            "Safe PRs auto-merge. I'll only ping you for cost, client output, or quality decisions.\n\n"
+            "Autopilot-lite mode: I can review, summarize, prepare, and recommend. "
+            "I will not merge risky PRs, call paid APIs, change secrets, or switch live systems without Cheuck approval.\n\n"
             "Commands: `what's next` · `phases` · `where are we` · `what's left` · `weekly`"
         )
 
@@ -189,11 +201,12 @@ class TelegramNotifier:
 # ─────────────────────────────────────────────
 
 class TelegramCommandHandler:
-    def __init__(self, token: str, chat_id: str, action_callback, project_manager=None):
+    def __init__(self, token: str, chat_id: str, action_callback, project_manager=None, intent_parser_enabled: bool = False):
         self.token = token
         self.chat_id = chat_id
         self.action_callback = action_callback
         self.project_manager = project_manager
+        self.intent_parser_enabled = intent_parser_enabled
         self.updater = Updater(token=token)
         self.dispatcher = self.updater.dispatcher
 
@@ -238,6 +251,16 @@ class TelegramCommandHandler:
             except ValueError:
                 update.message.reply_text("Invalid PR number. Try: approve 14")
                 return
+
+        if parts and parts[0] == "checkpoint":
+            checkpoint_text = text[len("checkpoint"):].strip()
+            if not checkpoint_text:
+                update.message.reply_text(
+                    "Add the runtime fact after `checkpoint`. Do not include secrets or API keys."
+                )
+                return
+            self.action_callback("checkpoint", checkpoint_text, update)
+            return
 
         # ── APPROVED — phase sign-off (must check BEFORE yes/kickoff block) ──
         if text_lower in ["approved", "approve phase", "phase approved", "sign off", "sign it off"]:
@@ -299,7 +322,7 @@ class TelegramCommandHandler:
             return
 
         # ── GPT-4o INTENT PARSING — for anything unrecognised ──
-        if self.project_manager:
+        if self.project_manager and self.intent_parser_enabled:
             update.message.reply_text("Let me think about that...")
             try:
                 action = self.project_manager.parse_intent(text, self.last_context)
@@ -310,14 +333,17 @@ class TelegramCommandHandler:
                 logger.error(f"Intent parsing failed: {e}")
 
         # ── FALLBACK ──
-        update.message.reply_text(
+        update.message.reply_text(self.supported_commands_message(), parse_mode="Markdown")
+
+    def supported_commands_message(self) -> str:
+        return (
             "*Commands:*\n\n"
             "*Project:*\n"
             "`what's next` — status and next step\n"
-            "`yes` — kick off next task\n"
             "`phases` — all phases and status\n"
             "`where are we` — current phase detail\n"
             "`what's left` — gap analysis\n"
+            "`checkpoint <runtime fact>` — record latest runtime fact\n"
             "`approved` — sign off completed phase\n"
             "`weekly` — weekly summary\n\n"
             "*PRs:*\n"
@@ -326,8 +352,7 @@ class TelegramCommandHandler:
             "`details <#>` — show files\n"
             "`skip <#>` — ignore\n\n"
             "`/status` — tower health\n"
-            "`/help` — this message",
-            parse_mode="Markdown"
+            "`/help` — this message"
         )
 
     def _handle_status(self, update: Update, context: CallbackContext):
@@ -342,10 +367,10 @@ class TelegramCommandHandler:
             "*Control Tower V3 Commands*\n\n"
             "*Project intelligence:*\n"
             "`what's next` — where the project stands and what's next\n"
-            "`yes` — kick off the next milestone\n"
             "`phases` — all phases with status\n"
             "`where are we` — current phase detail and progress\n"
             "`what's left` — gap analysis for active phase\n"
+            "`checkpoint <runtime fact>` — record latest verified runtime fact\n"
             "`approved` — sign off a completed phase\n"
             "`weekly` — Monday morning summary\n\n"
             "*PR management:*\n"
@@ -355,7 +380,7 @@ class TelegramCommandHandler:
             "`skip <PR#>` — stop alerting about this PR\n\n"
             "`/status` — tower health and daily stats\n"
             "`/help` — this message\n\n"
-            "_Safe PRs auto-merge. You only get pinged for cost, client output, or quality decisions._",
+            "_Autopilot-lite: Tower can review, summarize, prepare, and recommend. It will not merge risky PRs, call paid APIs, change secrets, or switch live systems without Cheuck approval._",
             parse_mode="Markdown"
         )
 

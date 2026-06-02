@@ -95,14 +95,30 @@ Never AUTO_MERGE if any HOLD trigger is present, even partially."""
 
 
 class AIReviewer:
-    def __init__(self, api_key: str, model: str = "gpt-4o"):
+    def __init__(self, api_key: str, model: str = "gpt-4o", enabled: bool = True):
         self.client = OpenAI(api_key=api_key)
         self.model = model
         self.daily_call_count = 0
         self.daily_limit = 50
+        self.enabled = enabled
+        self.last_openai_call_made = False
 
     def review_pr(self, pr_details: dict) -> dict:
         """Send PR details to GPT-4 and get a structured review decision."""
+        self.last_openai_call_made = False
+
+        if not self.enabled:
+            return {
+                "decision": "HOLD",
+                "confidence": "high",
+                "summary": "PR AI review is disabled.",
+                "reasoning": "ENABLE_PR_AI_REVIEW=false, so Tower did not call OpenAI. Cheuck needs to review this PR manually.",
+                "risks": ["AI review disabled"],
+                "fix_instructions": "",
+                "human_approval_required": True,
+                "human_approval_reason": "PR AI review is disabled. Manual review needed.",
+                "hold_trigger": "none"
+            }
 
         if self.daily_call_count >= self.daily_limit:
             logger.warning("Daily OpenAI call limit reached.")
@@ -172,6 +188,7 @@ Return only valid JSON. No markdown, no explanation outside the JSON."""
             )
 
             self.daily_call_count += 1
+            self.last_openai_call_made = True
             raw = response.choices[0].message.content.strip()
 
             if raw.startswith("```"):
