@@ -7,7 +7,7 @@ Persists to a local JSON file so state survives restarts.
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -28,16 +28,44 @@ class StateTracker:
         return {
             "reviewed_prs": {},    # pr_number -> {decision, timestamp, comment_id}
             "skipped_prs": [],     # pr numbers to ignore
+            "runtime_checkpoints": [],
             "daily_stats": {
                 "date": str(datetime.now().date()),
                 "openai_calls": 0,
+                "openai_calls_by_category": {
+                    "pr_review": 0,
+                    "pm_briefing": 0,
+                    "intent_parser": 0,
+                    "background_ai": 0,
+                    "weekly_summary": 0,
+                },
                 "prs_reviewed": 0,
                 "prs_merged": 0
             }
         }
 
+    def _ensure_shape(self):
+        self.state.setdefault("reviewed_prs", {})
+        self.state.setdefault("skipped_prs", [])
+        self.state.setdefault("runtime_checkpoints", [])
+        self.state.setdefault("daily_stats", {})
+        self.state["daily_stats"].setdefault("date", str(datetime.now().date()))
+        self.state["daily_stats"].setdefault("openai_calls", 0)
+        self.state["daily_stats"].setdefault("prs_reviewed", 0)
+        self.state["daily_stats"].setdefault("prs_merged", 0)
+        self.state["daily_stats"].setdefault("openai_calls_by_category", {})
+        for category in [
+            "pr_review",
+            "pm_briefing",
+            "intent_parser",
+            "background_ai",
+            "weekly_summary",
+        ]:
+            self.state["daily_stats"]["openai_calls_by_category"].setdefault(category, 0)
+
     def _save(self):
         try:
+            self._ensure_shape()
             with open(STATE_FILE, "w") as f:
                 json.dump(self.state, f, indent=2)
         except Exception as e:
@@ -50,6 +78,7 @@ class StateTracker:
         return pr_number in self.state["skipped_prs"]
 
     def mark_reviewed(self, pr_number: int, decision: str, comment_id: int = None):
+        self._ensure_shape()
         self.state["reviewed_prs"][str(pr_number)] = {
             "decision": decision,
             "timestamp": str(datetime.now()),
@@ -60,6 +89,7 @@ class StateTracker:
         self._save()
 
     def mark_skipped(self, pr_number: int):
+        self._ensure_shape()
         if pr_number not in self.state["skipped_prs"]:
             self.state["skipped_prs"].append(pr_number)
         self._save()
@@ -70,6 +100,7 @@ class StateTracker:
         self._save()
 
     def mark_merged(self, pr_number: int):
+        self._ensure_shape()
         self.state["daily_stats"]["prs_merged"] += 1
         self._save()
 
@@ -80,18 +111,55 @@ class StateTracker:
 
     def get_status(self) -> dict:
         self._check_daily_reset()
+        self._ensure_shape()
         return {
             "reviewed_count": len(self.state["reviewed_prs"]),
             "skipped_count": len(self.state["skipped_prs"]),
-            "daily_stats": self.state["daily_stats"]
+            "daily_stats": self.state["daily_stats"],
+            "latest_runtime_checkpoint": self.get_latest_runtime_checkpoint(),
         }
+
+    def record_openai_call(self, category: str):
+        self._check_daily_reset()
+        self._ensure_shape()
+        if category not in self.state["daily_stats"]["openai_calls_by_category"]:
+            self.state["daily_stats"]["openai_calls_by_category"][category] = 0
+        self.state["daily_stats"]["openai_calls"] += 1
+        self.state["daily_stats"]["openai_calls_by_category"][category] += 1
+        self._save()
+
+    def add_runtime_checkpoint(self, text: str) -> dict:
+        self._ensure_shape()
+        checkpoint = {
+            "text": text.strip()[:1000],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        checkpoints = [checkpoint] + self.state.get("runtime_checkpoints", [])[:4]
+        self.state["runtime_checkpoints"] = checkpoints
+        self._save()
+        return checkpoint
+
+    def get_latest_runtime_checkpoint(self) -> dict | None:
+        self._ensure_shape()
+        checkpoints = self.state.get("runtime_checkpoints", [])
+        if not checkpoints:
+            return None
+        return checkpoints[0]
 
     def _check_daily_reset(self):
         today = str(datetime.now().date())
+        self._ensure_shape()
         if self.state["daily_stats"]["date"] != today:
             self.state["daily_stats"] = {
                 "date": today,
                 "openai_calls": 0,
+                "openai_calls_by_category": {
+                    "pr_review": 0,
+                    "pm_briefing": 0,
+                    "intent_parser": 0,
+                    "background_ai": 0,
+                    "weekly_summary": 0,
+                },
                 "prs_reviewed": 0,
                 "prs_merged": 0
             }
