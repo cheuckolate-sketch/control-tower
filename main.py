@@ -20,13 +20,15 @@ import time
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
+load_dotenv()
+
 from app.github_client import GitHubClient
 from app.reviewer import AIReviewer
 from app.telegram_bot import TelegramNotifier, TelegramCommandHandler
 from app.state import StateTracker
 from app.project_manager import ProjectManager
-
-load_dotenv()
+from app.config import AI_FLAGS, PM_AI_CACHE_TTL_SECONDS, format_ai_flags_for_status
+from app.operator import build_operator_snapshot, checkpoint_is_stale
 
 # ── LOGGING ──
 logging.basicConfig(
@@ -61,11 +63,21 @@ STALL_CHECK_INTERVAL = 24 * 60 * 60  # 24 hours
 class ControlTower:
     def __init__(self):
         self.github = GitHubClient(GITHUB_TOKEN, GITHUB_REPO)
-        self.reviewer = AIReviewer(OPENAI_API_KEY, OPENAI_MODEL)
+        self.state = StateTracker()
+        self.reviewer = AIReviewer(
+            OPENAI_API_KEY,
+            OPENAI_MODEL,
+            enabled=AI_FLAGS["ENABLE_PR_AI_REVIEW"],
+        )
         self.reviewer.daily_limit = DAILY_LIMIT
         self.notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-        self.state = StateTracker()
-        self.pm = ProjectManager(github_client=self.github)
+        self.pm = ProjectManager(
+            github_client=self.github,
+            ai_briefings_enabled=AI_FLAGS["ENABLE_PM_AI_BRIEFINGS"],
+            intent_parser_enabled=AI_FLAGS["ENABLE_AI_INTENT_PARSER"],
+            cache_ttl_seconds=PM_AI_CACHE_TTL_SECONDS,
+            call_recorder=self.state.record_openai_call,
+        )
 
         # Conversation state
         self.pending_kickoff = False        # waiting for Cheuck to say "yes" after whats_next
@@ -88,7 +100,29 @@ class ControlTower:
             TELEGRAM_CHAT_ID,
             self.handle_telegram_action,
             project_manager=self.pm,
+            intent_parser_enabled=AI_FLAGS["ENABLE_AI_INTENT_PARSER"],
         )
+
+    def build_operator_snapshot_message(self, known_blocker: str = "Not verified") -> str:
+        latest_merged = self.github.get_merged_prs_with_diffs(limit=3)
+        open_prs = self.github.get_open_pr_summaries(limit=5)
+        open_issues = self.github.get_open_issue_summaries(limit=5)
+        closed_unmerged = self.github.get_latest_closed_unmerged_pr()
+        checkpoint = self.state.get_latest_runtime_checkpoint()
+        active_phase = self.pm.get_active_phase_snapshot()
+        msg = build_operator_snapshot(
+            repo_name=GITHUB_REPO,
+            phase=active_phase,
+            latest_merged_prs=latest_merged,
+            open_prs=open_prs,
+            open_issues=open_issues,
+            latest_closed_unmerged_pr=closed_unmerged,
+            runtime_checkpoint=checkpoint,
+            known_blocker=known_blocker,
+        )
+        if checkpoint_is_stale(checkpoint, latest_merged):
+            msg += "\n\nRuntime checkpoint may be stale. Rerun the relevant endpoint or add a checkpoint before making the next decision."
+        return msg
 
     # ─────────────────────────────────────────────
     # TELEGRAM ACTION HANDLER
@@ -100,6 +134,11 @@ class ControlTower:
         if action == "status":
             activity = self.github.get_recent_activity_summary()
             stats = self.state.get_status()
+            counts = stats["daily_stats"].get("openai_calls_by_category", {})
+            counts_text = "\n".join([
+                f"- {category}: {counts.get(category, 0)}"
+                for category in ["pr_review", "pm_briefing", "intent_parser", "background_ai", "weekly_summary"]
+            ])
             msg = (
                 f"⬡ *Control Tower V3 Status*\n\n"
                 f"PRs reviewed today: {stats['daily_stats']['prs_reviewed']}\n"
@@ -109,18 +148,31 @@ class ControlTower:
                 f"Open issues: {activity.get('open_issues', '?')}\n"
                 f"Last merge: {activity.get('last_merge_at', 'Unknown')}\n"
                 f"Repo: `{GITHUB_REPO}`\n\n"
-                f"_Safe PRs auto-merge. You only get pinged for cost, client output, or quality decisions._"
+                f"*OpenAI calls today:*\n{counts_text}\n\n"
+                f"{format_ai_flags_for_status()}\n\n"
+                f"{self.build_operator_snapshot_message()}"
             )
             update.message.reply_text(msg, parse_mode="Markdown")
+            return
+
+        if action == "checkpoint":
+            checkpoint = self.state.add_runtime_checkpoint(str(payload))
+            update.message.reply_text(
+                "Checkpoint recorded. I will include it in `status`, `what's next`, and `where are we`.\n\n"
+                "Reminder: do not paste secrets, API keys, or tokens into checkpoints."
+            )
+            self.cmd_handler.set_last_context("checkpoint", checkpoint["text"])
             return
 
         # ── WHAT'S NEXT ──
         if action == "whats_next":
             try:
+                snapshot = self.build_operator_snapshot_message()
                 response = self.pm.get_full_briefing()
                 self.pending_kickoff = True
-                self.cmd_handler.set_last_context("whats_next", response)
-                update.message.reply_text(response)
+                full_response = f"{snapshot}\n\n{response}"
+                self.cmd_handler.set_last_context("whats_next", full_response)
+                update.message.reply_text(full_response, parse_mode="Markdown")
             except Exception as e:
                 logger.error(f"whats_next error: {e}")
                 update.message.reply_text("Having trouble checking status right now. Try again in a moment.")
@@ -136,6 +188,27 @@ class ControlTower:
                 brief = self.pm.create_next_issue_brief()
                 if not brief:
                     update.message.reply_text("Couldn't generate the issue brief. Try again.")
+                    return
+
+                open_issues = self.github.get_open_issue_summaries(limit=20)
+                brief_title = brief["title"].strip().lower()
+                duplicate_issue = next(
+                    (
+                        issue for issue in open_issues
+                        if brief_title and (
+                            brief_title == issue["title"].strip().lower()
+                            or brief_title in issue["title"].strip().lower()
+                            or issue["title"].strip().lower() in brief_title
+                        )
+                    ),
+                    None,
+                )
+                if duplicate_issue:
+                    self.pending_kickoff = False
+                    update.message.reply_text(
+                        f"Similar open issue found: #{duplicate_issue['number']} {duplicate_issue['title']}\n\n"
+                        "Next safe action: continue the existing issue, close/rewrite it, or create a narrower follow-up only if genuinely different."
+                    )
                     return
 
                 issue = self.github.create_issue(
@@ -173,9 +246,11 @@ class ControlTower:
         # ── WHERE ARE WE ──
         if action == "where_are_we":
             try:
+                snapshot = self.build_operator_snapshot_message()
                 detail = self.pm.get_active_phase_detail()
-                self.cmd_handler.set_last_context("where_are_we", detail)
-                update.message.reply_text(detail, parse_mode="Markdown")
+                full_detail = f"{snapshot}\n\n{detail}"
+                self.cmd_handler.set_last_context("where_are_we", full_detail)
+                update.message.reply_text(full_detail, parse_mode="Markdown")
             except Exception as e:
                 logger.error(f"Where are we error: {e}")
                 update.message.reply_text("Couldn't check current phase right now.")
@@ -184,9 +259,11 @@ class ControlTower:
         # ── WHAT'S LEFT ──
         if action == "whats_left":
             try:
+                snapshot = self.build_operator_snapshot_message()
                 gap = self.pm.get_whats_left()
-                self.cmd_handler.set_last_context("whats_left", gap)
-                update.message.reply_text(gap, parse_mode="Markdown")
+                full_gap = f"{snapshot}\n\n{gap}"
+                self.cmd_handler.set_last_context("whats_left", full_gap)
+                update.message.reply_text(full_gap, parse_mode="Markdown")
             except Exception as e:
                 logger.error(f"Whats left error: {e}")
                 update.message.reply_text("Couldn't run gap analysis right now.")
@@ -212,6 +289,9 @@ class ControlTower:
 
         # ── WEEKLY SUMMARY ──
         if action == "weekly_summary":
+            if not AI_FLAGS["ENABLE_WEEKLY_AI_SUMMARY"]:
+                update.message.reply_text("Weekly AI summary is disabled. Use `status` or `what's next` for deterministic status.")
+                return
             try:
                 summary = self.pm.get_weekly_summary()
                 self.notifier.send_weekly_summary(summary)
@@ -315,6 +395,8 @@ class ControlTower:
             return
 
         review = self.reviewer.review_pr(details)
+        if self.reviewer.last_openai_call_made:
+            self.state.record_openai_call("pr_review")
         decision = review.get("decision", "HOLD")
         hold_trigger = review.get("hold_trigger", "none")
 
@@ -375,7 +457,9 @@ class ControlTower:
             reasoning=review.get("reasoning", ""),
             risks=review.get("risks", []),
             human_reason=review.get("human_approval_reason", ""),
-            hold_trigger=hold_trigger
+            hold_trigger=hold_trigger,
+            files_changed=details.get("files_changed", []),
+            check_runs=details.get("check_runs", []),
         )
 
     # ─────────────────────────────────────────────
@@ -414,6 +498,9 @@ class ControlTower:
 
     def check_phase_completion(self):
         """Check if active phase looks done. Alert Cheuck and wait for 'approved'."""
+        if not AI_FLAGS["ENABLE_BACKGROUND_AI"]:
+            logger.info("Skipping phase completion check because ENABLE_BACKGROUND_AI=false.")
+            return
         if self.pending_phase_id or self.phase_completion_pinged:
             return  # already waiting for approval or already pinged
 
@@ -433,6 +520,8 @@ class ControlTower:
 
     def send_weekly_summary_if_monday(self):
         """Send weekly summary automatically on Monday at 9am."""
+        if not AI_FLAGS["ENABLE_WEEKLY_AI_SUMMARY"]:
+            return
         now = datetime.now()
         if now.weekday() == 0 and now.hour == 9 and now.minute < 1:
             try:
@@ -457,12 +546,14 @@ class ControlTower:
             self.notifier.chat_id = chat_id
             self.cmd_handler.chat_id = chat_id
 
-        # Init phase map on startup
-        try:
-            self.pm.get_or_init_phases()
-            logger.info("Phase map ready.")
-        except Exception as e:
-            logger.error(f"Phase map init failed: {e}")
+        if AI_FLAGS["ENABLE_BACKGROUND_AI"]:
+            try:
+                self.pm.get_or_init_phases()
+                logger.info("Phase map ready.")
+            except Exception as e:
+                logger.error(f"Phase map init failed: {e}")
+        else:
+            logger.info("Skipping phase map init because ENABLE_BACKGROUND_AI=false.")
 
         self.cmd_handler.start()
         self.notifier.send_startup_message()
