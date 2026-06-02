@@ -35,6 +35,14 @@ def contains_checkpoint_secret(text: str) -> bool:
     return any(pattern.search(text) for pattern in SECRET_VALUE_PATTERNS)
 
 
+def sanitize_checkpoint_text(text: str) -> str:
+    """Remove credential-looking values before checkpoint text is persisted."""
+    sanitized = SECRET_ASSIGNMENT_PATTERN.sub("[REDACTED_SECRET]", text)
+    for pattern in SECRET_VALUE_PATTERNS:
+        sanitized = pattern.sub("[REDACTED_SECRET]", sanitized)
+    return sanitized
+
+
 class StateTracker:
     def __init__(self):
         self.state = self._load()
@@ -152,7 +160,7 @@ class StateTracker:
     def add_runtime_checkpoint(self, text: str) -> dict:
         self._ensure_shape()
         checkpoint = {
-            "text": text.strip()[:1000],
+            "text": sanitize_checkpoint_text(text.strip())[:1000],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         checkpoints = [checkpoint] + self.state.get("runtime_checkpoints", [])[:4]
