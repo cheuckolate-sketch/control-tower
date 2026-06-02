@@ -59,16 +59,45 @@ def classify_lane(text: str) -> dict[str, str]:
 def build_next_best_action(snapshot: dict[str, Any]) -> str:
     checkpoint = snapshot.get("runtime_checkpoint") or {}
     checkpoint_text = checkpoint.get("text") or ""
+    checkpoint_lower = checkpoint_text.lower()
     latest_merged = snapshot.get("latest_merged_prs") or []
     open_prs = snapshot.get("open_prs") or []
 
-    if "APIFY_TOKEN" in checkpoint_text or "apify" in checkpoint_text.lower() and "missing" in checkpoint_text.lower():
+    apify_mentioned = "apify" in checkpoint_lower or "APIFY_TOKEN" in checkpoint_text
+    apify_missing = apify_mentioned and any(
+        phrase in checkpoint_lower
+        for phrase in [
+            "missing",
+            "incomplete",
+            "not configured",
+            "not set",
+            "not ready",
+            "blocked",
+            "failed",
+        ]
+    )
+    apify_ready = apify_mentioned and (
+        "ready_for_paid_sandbox_call true" in checkpoint_lower
+        or "readiness passed" in checkpoint_lower
+        or "configured" in checkpoint_lower
+        or "ready" in checkpoint_lower
+    ) and not apify_missing
+
+    if apify_missing:
         action = "Add missing Apify config in Railway, then rerun the readiness endpoint."
         why = "The latest runtime checkpoint says Scenario 3A readiness is blocked by missing Apify config."
         command = "checkpoint Scenario 3A readiness rechecked. Record the endpoint version and missing config only."
         do_not = "Do not paste secrets into Telegram, GitHub, docs, or ChatGPT. Do not run Apify scraping yet."
         manual = "Yes, Railway env only"
         cost = "None for readiness check; paid risk starts at sandbox scraping"
+        live = "None"
+    elif apify_ready:
+        action = "Prepare one-creator Apify sandbox call with hard confirmation. Do not run scraping yet."
+        why = "The latest runtime checkpoint says Apify readiness/config is ready enough to prepare the sandbox step."
+        command = "checkpoint Apify sandbox call prepared only. Waiting for hard confirmation before scraping."
+        do_not = "Do not run scraping or paid Apify calls until Cheuck explicitly confirms the one-creator sandbox call."
+        manual = "Yes, hard confirmation before paid sandbox call"
+        cost = "Paid risk starts only if scraping is run"
         live = "None"
     elif open_prs:
         pr = open_prs[0]
