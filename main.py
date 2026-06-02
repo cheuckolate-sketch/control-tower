@@ -10,6 +10,8 @@ V3 additions:
 - HOLD escalation follow-up (once, after 4 hours)
 - Builder PR notifications (pings when ai-built PR opens)
 - Weekly summary now fetches real merged PRs
+V3.1 fix:
+- phase_completion_pinged flag prevents double phase complete alerts
 """
 
 import logging
@@ -66,8 +68,9 @@ class ControlTower:
         self.pm = ProjectManager(github_client=self.github)
 
         # Conversation state
-        self.pending_kickoff = False       # waiting for Cheuck to say "yes" after whats_next
-        self.pending_phase_id = None       # waiting for "approved" after phase complete alert
+        self.pending_kickoff = False        # waiting for Cheuck to say "yes" after whats_next
+        self.pending_phase_id = None        # waiting for "approved" after phase complete alert
+        self.phase_completion_pinged = False # prevents double-pinging on same phase completion
 
         # HOLD escalation tracking: {pr_number: datetime when HOLD was sent}
         self.hold_sent_at: dict[int, datetime] = {}
@@ -191,13 +194,14 @@ class ControlTower:
 
         # ── APPROVE PHASE ──
         if action == "approve_phase":
-            phase_id = payload  # passed from cmd_handler
+            phase_id = payload
             if not phase_id:
                 update.message.reply_text("Not sure which phase to approve. Send `phases` to check.")
                 return
             try:
                 msg = self.pm.approve_phase(phase_id)
                 self.pending_phase_id = None
+                self.phase_completion_pinged = False  # reset so next phase can be detected
                 self.cmd_handler.set_pending_phase(None)
                 self.cmd_handler.set_last_context("approve_phase", msg)
                 update.message.reply_text(msg, parse_mode="Markdown")
@@ -390,14 +394,12 @@ class ControlTower:
                     self.notifier.send_hold_followup(pr_number, pr.title)
                     self.hold_followed_up.add(pr_number)
                 else:
-                    # PR was closed or merged — clean up
                     self.hold_sent_at.pop(pr_number, None)
 
     def check_stall(self):
         """Ping Cheuck if no PRs merged in 48 hours. Only pings once per stall period."""
         now = datetime.now(timezone.utc)
 
-        # Don't ping again within 24 hours of last stall ping
         if self.last_stall_ping and (now - self.last_stall_ping).total_seconds() < STALL_CHECK_INTERVAL:
             return
 
@@ -412,13 +414,14 @@ class ControlTower:
 
     def check_phase_completion(self):
         """Check if active phase looks done. Alert Cheuck and wait for 'approved'."""
-        if self.pending_phase_id:
-            return  # Already waiting for approval
+        if self.pending_phase_id or self.phase_completion_pinged:
+            return  # already waiting for approval or already pinged
 
         try:
             is_complete, active_phase, msg = self.pm.check_phase_completion()
             if is_complete and active_phase:
                 self.pending_phase_id = active_phase["id"]
+                self.phase_completion_pinged = True
                 self.cmd_handler.set_pending_phase(active_phase["id"])
                 self.notifier.send_phase_complete_alert(
                     active_phase["id"],
