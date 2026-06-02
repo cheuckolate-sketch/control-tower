@@ -1,6 +1,7 @@
 """
 github_client.py
-Handles all GitHub API interactions — fetching PRs, diffs, CI status, posting comments, merging.
+Handles all GitHub API interactions.
+V2: Added create_issue method for planner kickoff.
 """
 
 import logging
@@ -16,7 +17,6 @@ class GitHubClient:
         logger.info(f"Connected to GitHub repo: {repo_name}")
 
     def get_open_prs(self) -> list:
-        """Return all open PRs not targeting a non-main branch."""
         try:
             prs = self.repo.get_pulls(state="open", base="main")
             return list(prs)
@@ -25,9 +25,7 @@ class GitHubClient:
             return []
 
     def get_pr_details(self, pr) -> dict:
-        """Extract everything the reviewer needs about a PR."""
         try:
-            # Get diff
             files_changed = []
             for f in pr.get_files():
                 files_changed.append({
@@ -35,10 +33,9 @@ class GitHubClient:
                     "status": f.status,
                     "additions": f.additions,
                     "deletions": f.deletions,
-                    "patch": f.patch[:3000] if f.patch else ""  # cap patch size
+                    "patch": f.patch[:3000] if f.patch else ""
                 })
 
-            # Get CI check status
             commit = self.repo.get_commit(pr.head.sha)
             check_runs = []
             for check in commit.get_check_runs():
@@ -47,11 +44,6 @@ class GitHubClient:
                     "status": check.status,
                     "conclusion": check.conclusion
                 })
-
-            # Get linked issue if any
-            issue_body = ""
-            for label in pr.labels:
-                pass  # labels collected below
 
             return {
                 "number": pr.number,
@@ -72,8 +64,7 @@ class GitHubClient:
             logger.error(f"Failed to get PR details for PR #{pr.number}: {e}")
             return {}
 
-    def get_existing_bot_comment(self, pr, marker: str) -> object | None:
-        """Check if Control Tower already commented on this PR."""
+    def get_existing_bot_comment(self, pr, marker: str):
         try:
             for comment in pr.get_issue_comments():
                 if marker in comment.body:
@@ -83,7 +74,6 @@ class GitHubClient:
         return None
 
     def post_pr_comment(self, pr, body: str):
-        """Post a comment on the PR."""
         try:
             pr.create_issue_comment(body)
             logger.info(f"Posted comment on PR #{pr.number}")
@@ -91,14 +81,12 @@ class GitHubClient:
             logger.error(f"Failed to post comment on PR #{pr.number}: {e}")
 
     def update_pr_comment(self, comment, body: str):
-        """Update an existing comment."""
         try:
             comment.edit(body)
         except GithubException as e:
             logger.error(f"Failed to update comment: {e}")
 
     def merge_pr(self, pr) -> bool:
-        """Merge a PR into main."""
         try:
             result = pr.merge(
                 commit_message=f"[Control Tower] Merging PR #{pr.number}: {pr.title}",
@@ -111,7 +99,6 @@ class GitHubClient:
             return False
 
     def get_pr_by_number(self, number: int):
-        """Fetch a specific PR by number."""
         try:
             return self.repo.get_pull(number)
         except GithubException as e:
@@ -119,9 +106,18 @@ class GitHubClient:
             return None
 
     def get_issues(self, state: str = "open") -> list:
-        """Get GitHub issues (for context on what Codex is working on)."""
         try:
             return list(self.repo.get_issues(state=state))
         except GithubException as e:
             logger.error(f"Failed to fetch issues: {e}")
             return []
+
+    def create_issue(self, title: str, body: str):
+        """Create a new GitHub Issue for the next milestone."""
+        try:
+            issue = self.repo.create_issue(title=title, body=body)
+            logger.info(f"Created GitHub Issue #{issue.number}: {title}")
+            return issue
+        except GithubException as e:
+            logger.error(f"Failed to create issue: {e}")
+            return None
