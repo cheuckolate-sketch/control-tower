@@ -461,7 +461,10 @@ RECENT MERGED PRs (what was actually built):
 Tell him:
 1. What was recently completed (based on actual PRs, not assumptions)
 2. What the next milestone is and why it matters
-3. Ask if he wants to kick it off
+3. Whether Cheuck needs to do anything manually before the next milestone
+4. Whether credentials/API setup, cost, live-system impact, or client-output risk is likely
+5. The exact next Telegram command to type
+6. What not to do yet
 
 Plain English. No PR numbers. No file names. No jargon. Conversational."""
 
@@ -632,6 +635,13 @@ The body must include:
 - Success criteria (how to know it's done)
 - Scope (what to change, what NOT to touch)
 - Safety classification (auto-merge safe or HOLD required)
+- Cheuck action needed
+- Manual setup needed
+- Credential setup needed
+- Cost risk
+- Live-system risk
+- Business-logic risk
+- Do-not-do warnings
 - Expected files to change
 - Test requirements
 - Rollback plan
