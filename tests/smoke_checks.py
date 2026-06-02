@@ -4,7 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.operator import build_next_best_action
-from app.state import contains_checkpoint_secret
+from app.state import contains_checkpoint_secret, sanitize_checkpoint_text
 
 
 def _action_for_checkpoint(text: str) -> str:
@@ -27,7 +27,9 @@ def test_apify_missing_config_triggers_missing_config():
 
 
 def test_checkpoint_secret_like_value_is_blocked():
-    assert contains_checkpoint_secret("OPENAI_API_KEY=sk-test1234567890abcdef1234567890")
+    secret_text = "OPENAI_API_KEY=sk-test1234567890abcdef1234567890"
+    assert contains_checkpoint_secret(secret_text)
+    assert "sk-test" not in sanitize_checkpoint_text(secret_text)
     assert not contains_checkpoint_secret("APIFY_TOKEN configured")
 
 
