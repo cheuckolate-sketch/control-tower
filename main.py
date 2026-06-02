@@ -113,11 +113,11 @@ class ControlTower:
                 if issue:
                     self.pending_kickoff = False
                     msg = (
-                        f"✅ *Task created*\n\n"
+                        f"✅ *Task created — Issue #{issue.number}*\n\n"
                         f"_{brief['milestone']}_\n\n"
-                        f"GitHub Issue #{issue.number} is live. "
-                        f"The builder will pick it up, write the code, and open a PR. "
-                        f"I'll ping you if anything needs your call."
+                        f"Now tell Codex this:\n\n"
+                        f"`Work on GitHub Issue #{issue.number}. Open a PR. Do not merge. Use the issue as the full task brief.`\n\n"
+                        f"Once Codex opens the PR, I'll take over from there."
                     )
                     update.message.reply_text(msg, parse_mode="Markdown")
                 else:
