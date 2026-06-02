@@ -2,6 +2,7 @@
 reviewer.py
 Sends PR context to OpenAI GPT-4 and gets a structured review decision.
 V2: Added auto-merge logic, cost triggers, quality triggers, client output triggers.
+V3: Added ai-built label awareness — AI-generated PRs get stricter confidence scoring.
 """
 
 import json
@@ -61,6 +62,15 @@ Live system triggers:
 - Deleting or renaming fields/records
 - Any destructive or irreversible action
 
+AI-BUILT PR RULES (label: ai-built):
+When a PR carries the "ai-built" label, it was written by the GitHub Actions AI builder, not a human.
+Apply these additional rules:
+- Never assign confidence "high" for logic changes, even if they look correct. Max confidence is "medium".
+- Scrutinise API call patterns more carefully — AI-generated code can introduce unintended retry loops or duplicate calls.
+- If the PR touches anything beyond its stated scope in the issue, treat it as a FIX or HOLD.
+- Documentation-only and test-only ai-built PRs can still AUTO_MERGE at high confidence.
+- Always note in your reasoning that this was AI-generated code.
+
 YOUR OUTPUT must always be valid JSON in exactly this format:
 {
   "decision": "AUTO_MERGE" | "MERGE" | "FIX" | "HOLD",
@@ -108,6 +118,9 @@ class AIReviewer:
                 "hold_trigger": "none"
             }
 
+        labels = pr_details.get("labels", [])
+        is_ai_built = "ai-built" in labels
+
         files_summary = ""
         for f in pr_details.get("files_changed", [])[:10]:
             files_summary += f"\n- {f['filename']} ({f['status']}, +{f['additions']} -{f['deletions']})"
@@ -119,8 +132,17 @@ class AIReviewer:
             status = c.get("conclusion") or c.get("status")
             checks_summary += f"\n- {c['name']}: {status}"
 
-        prompt = f"""Review this Pull Request and return your decision as JSON.
+        # Explicit ai-built callout at the top of the prompt so it's never missed
+        ai_built_notice = ""
+        if is_ai_built:
+            ai_built_notice = (
+                "\n⚠️ AI-BUILT PR: This code was written by the GitHub Actions AI builder, not a human. "
+                "Apply the AI-BUILT PR RULES from your instructions. "
+                "Max confidence for logic changes is medium. Scrutinise scope carefully.\n"
+            )
 
+        prompt = f"""Review this Pull Request and return your decision as JSON.
+{ai_built_notice}
 PR #{pr_details.get('number')}: {pr_details.get('title')}
 Branch: {pr_details.get('branch')} → {pr_details.get('base')}
 Author: {pr_details.get('author')}
@@ -134,7 +156,7 @@ FILES CHANGED:{files_summary}
 
 CI CHECKS:{checks_summary if checks_summary else ' No checks found yet'}
 
-LABELS: {', '.join(pr_details.get('labels', [])) or 'None'}
+LABELS: {', '.join(labels) or 'None'}
 
 Return only valid JSON. No markdown, no explanation outside the JSON."""
 
@@ -158,7 +180,22 @@ Return only valid JSON. No markdown, no explanation outside the JSON."""
                     raw = raw[4:]
 
             result = json.loads(raw)
-            logger.info(f"Review complete for PR #{pr_details.get('number')}: {result.get('decision')}")
+
+            # Hard enforce: ai-built logic PRs cannot be high confidence AUTO_MERGE
+            if is_ai_built and result.get("decision") == "AUTO_MERGE":
+                files = pr_details.get("files_changed", [])
+                has_logic_changes = any(
+                    f.get("filename", "").endswith(".py") and f.get("additions", 0) > 0
+                    for f in files
+                    if not f.get("filename", "").startswith("docs/")
+                    and not f.get("filename", "").startswith("tests/")
+                )
+                if has_logic_changes and result.get("confidence") == "high":
+                    result["confidence"] = "medium"
+                    result["reasoning"] += " Confidence capped at medium — this is AI-generated logic code."
+                    logger.info(f"PR #{pr_details.get('number')}: ai-built confidence downgraded from high to medium.")
+
+            logger.info(f"Review complete for PR #{pr_details.get('number')}: {result.get('decision')} ({'ai-built' if is_ai_built else 'human'})")
             return result
 
         except json.JSONDecodeError as e:
