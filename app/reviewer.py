@@ -1,6 +1,7 @@
 """
 reviewer.py
 Sends PR context to OpenAI GPT-4 and gets a structured review decision.
+V2: Added auto-merge logic, cost triggers, quality triggers, client output triggers.
 """
 
 import json
@@ -11,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are the AI architect and governance reviewer for the Creator Campaign OS project at Invictus Blue, a Malaysia-based media agency.
 
-Your job is to review GitHub Pull Requests opened by Codex (an AI builder) and decide what to do with them.
+Your job is to review GitHub Pull Requests and decide what to do with them.
 
 THE PROJECT:
 - Backend migration from Make.com to Python/FastAPI on Railway
@@ -21,12 +22,40 @@ THE PROJECT:
 - OpenAI for AI creator vetting
 - Railway + FastAPI = new backend
 
-SAFETY BOUNDARIES (NEVER approve PRs that touch these without flagging):
-- Live Airtable schema changes (field/interface/button changes)
+AUTO-MERGE ALLOWED (safe to merge without asking Cheuck):
+- Documentation changes only (README, AGENTS.md, docs/)
+- Test additions or fixes (no logic changes)
+- Code refactoring with no behaviour change
+- Bug fixes with passing tests
+- Schema check or health check updates
+- Backend plumbing with no live system impact
+- Any PR where: all CI checks pass + risk is low + no HOLD triggers below
+
+ALWAYS HOLD — NEVER AUTO-MERGE (always ask Cheuck):
+Cost triggers:
+- Any change that adds, modifies, or increases Apify scraping calls
+- Any change that adds, modifies, or increases OpenAI API calls
+- Any change to retry logic that could multiply API calls
+- Any change that could cause cost to exceed RM100 per batch
+
+Client output triggers:
+- Any change to client-facing report format or content
+- Any change to creator ranking, scoring, or rationale logic
+- Any change to what "shortlisted" means
+- Any change to what fields appear in client reports
+- Any change to AI evaluation criteria
+
+Product quality triggers:
+- Any change that degrades the workflow experience for the campaign team
+- Any change to how creators are matched, evaluated, or recommended
+- Any change to planner-facing interfaces or statuses
+- Any change that reduces system reliability or trust
+
+Live system triggers:
+- Live Airtable schema changes (fields, interfaces, buttons, formulas)
 - Live Make scenario changes
 - Railway env/secrets/settings changes
 - GitHub secrets or API key changes
-- OpenAI or Apify paid call logic changes
 - Production data writebacks
 - Switching live Airtable buttons from Make to backend
 - Deleting or renaming fields/records
@@ -34,22 +63,25 @@ SAFETY BOUNDARIES (NEVER approve PRs that touch these without flagging):
 
 YOUR OUTPUT must always be valid JSON in exactly this format:
 {
-  "decision": "MERGE" | "FIX" | "HOLD",
+  "decision": "AUTO_MERGE" | "MERGE" | "FIX" | "HOLD",
   "confidence": "high" | "medium" | "low",
   "summary": "One sentence summary of what this PR does",
   "reasoning": "2-3 sentences explaining your decision",
   "risks": ["risk 1", "risk 2"],
-  "fix_instructions": "If decision is FIX, exact instructions for Codex. Otherwise empty string.",
+  "fix_instructions": "If decision is FIX, exact instructions for the builder. Otherwise empty string.",
   "human_approval_required": true | false,
-  "human_approval_reason": "Why Cheuck needs to approve this. Empty string if not needed."
+  "human_approval_reason": "Why Cheuck needs to approve this. Empty string if not needed.",
+  "hold_trigger": "cost" | "client_output" | "product_quality" | "live_system" | "none"
 }
 
 DECISION RULES:
-- MERGE: PR is safe, tests pass, scope matches issue, no live system risk
-- FIX: PR has problems Codex can fix (failing tests, wrong scope, missing files)
-- HOLD: Human judgment needed — touches live systems, costs money, business logic change, risky
+- AUTO_MERGE: Safe change, all checks pass, no HOLD triggers, Cheuck does not need to be involved
+- MERGE: Safe but Cheuck should confirm (medium confidence or borderline)
+- FIX: PR has problems the builder can fix
+- HOLD: Any HOLD trigger above is present — always requires Cheuck
 
-Always be conservative. When in doubt, HOLD."""
+Always be conservative. When in doubt, HOLD.
+Never AUTO_MERGE if any HOLD trigger is present, even partially."""
 
 
 class AIReviewer:
@@ -63,7 +95,7 @@ class AIReviewer:
         """Send PR details to GPT-4 and get a structured review decision."""
 
         if self.daily_call_count >= self.daily_limit:
-            logger.warning("Daily OpenAI call limit reached. Skipping review.")
+            logger.warning("Daily OpenAI call limit reached.")
             return {
                 "decision": "HOLD",
                 "confidence": "high",
@@ -72,12 +104,12 @@ class AIReviewer:
                 "risks": ["Daily limit exceeded"],
                 "fix_instructions": "",
                 "human_approval_required": True,
-                "human_approval_reason": "Daily OpenAI call limit reached. Manual review needed."
+                "human_approval_reason": "Daily OpenAI call limit reached. Manual review needed.",
+                "hold_trigger": "none"
             }
 
-        # Build the review prompt
         files_summary = ""
-        for f in pr_details.get("files_changed", [])[:10]:  # cap at 10 files
+        for f in pr_details.get("files_changed", [])[:10]:
             files_summary += f"\n- {f['filename']} ({f['status']}, +{f['additions']} -{f['deletions']})"
             if f.get("patch"):
                 files_summary += f"\n```\n{f['patch'][:1500]}\n```"
@@ -120,7 +152,6 @@ Return only valid JSON. No markdown, no explanation outside the JSON."""
             self.daily_call_count += 1
             raw = response.choices[0].message.content.strip()
 
-            # Strip markdown code fences if present
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
@@ -150,5 +181,6 @@ Return only valid JSON. No markdown, no explanation outside the JSON."""
             "risks": ["Automated review failed"],
             "fix_instructions": "",
             "human_approval_required": True,
-            "human_approval_reason": reason
+            "human_approval_reason": reason,
+            "hold_trigger": "none"
         }
