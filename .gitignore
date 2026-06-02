@@ -1,0 +1,8 @@
+.env
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+control_tower_state.json
+venv/
+.venv/
