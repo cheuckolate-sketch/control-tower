@@ -139,7 +139,12 @@ class TelegramCommandHandler:
             update.message.reply_text("Checking project status...")
             self.action_callback("whats_next", None, update)
 
-        elif text in ["yes", "yeah", "ok", "go", "go ahead", "kick it off", "start", "proceed"]:
+        elif any(phrase in text for phrase in [
+            "yes", "yeah", "yep", "yup", "ok", "okay", "ok la", "ok lah",
+            "go", "go ahead", "go lah", "go la", "kick it off", "start",
+            "proceed", "sure", "sure la", "do it", "lets do it", "let's do it",
+            "confirm", "confirmed", "jalan", "boleh", "can", "can lah"
+        ]):
             update.message.reply_text("On it. Creating the next task...")
             self.action_callback("kickoff", None, update)
 
