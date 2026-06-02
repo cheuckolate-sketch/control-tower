@@ -7,11 +7,32 @@ Persists to a local JSON file so state survives restarts.
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
 STATE_FILE = "control_tower_state.json"
+
+
+SECRET_VALUE_PATTERNS = [
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\b(?:sk|ghp|gho|github_pat|xox[baprs])-?[A-Za-z0-9_=-]{16,}\b"),
+    re.compile(r"\b[A-Za-z0-9_\-]{32,}\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\b"),
+]
+
+SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"\b[A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY|ACCESS[_-]?KEY)[A-Z0-9_]*\s*=\s*\S+",
+    re.IGNORECASE,
+)
+
+
+def contains_checkpoint_secret(text: str) -> bool:
+    """Return True when checkpoint text appears to contain a credential value."""
+    if SECRET_ASSIGNMENT_PATTERN.search(text):
+        return True
+    return any(pattern.search(text) for pattern in SECRET_VALUE_PATTERNS)
 
 
 class StateTracker:
