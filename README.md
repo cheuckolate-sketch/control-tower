@@ -123,7 +123,8 @@ Railway auto-deploys on push to main. Check logs in Railway dashboard.
 ## Cost Guard
 
 Set `DAILY_OPENAI_CALL_LIMIT` in `.env` to cap GPT-4 calls per day.
-Default: 50 calls/day. Each PR review = 1 call.
+Default: 50 calls/day. Each PR review = 1 call when PR AI review is explicitly enabled.
+For manual mode, set `DAILY_OPENAI_CALL_LIMIT=0` so Control Tower cannot spend OpenAI calls by default.
 When limit is hit, all PRs go to HOLD and Cheuck is alerted.
 
 ---

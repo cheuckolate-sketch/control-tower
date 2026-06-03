@@ -23,8 +23,8 @@ def env_int(name: str, default: int) -> int:
 
 
 AI_FLAGS = {
-    "ENABLE_PR_AI_REVIEW": env_bool("ENABLE_PR_AI_REVIEW", True),
-    "ENABLE_PM_AI_BRIEFINGS": env_bool("ENABLE_PM_AI_BRIEFINGS", True),
+    "ENABLE_PR_AI_REVIEW": env_bool("ENABLE_PR_AI_REVIEW", False),
+    "ENABLE_PM_AI_BRIEFINGS": env_bool("ENABLE_PM_AI_BRIEFINGS", False),
     "ENABLE_BACKGROUND_AI": env_bool("ENABLE_BACKGROUND_AI", False),
     "ENABLE_AI_INTENT_PARSER": env_bool("ENABLE_AI_INTENT_PARSER", False),
     "ENABLE_WEEKLY_AI_SUMMARY": env_bool("ENABLE_WEEKLY_AI_SUMMARY", False),
